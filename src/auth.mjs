@@ -49,10 +49,39 @@ function hasStateFile() { return fs.existsSync(STATE_FILE); }
 
 // Returns { browser, context } in state-file mode, or { context } only in
 // persistent-profile mode. Caller should use the returned `closer` to clean up.
+//
+// HIGGS_CDP_URL — if set, ALL other modes are bypassed and we connect to an
+// already-running Chrome via CDP. Use this when DataDome has flagged your
+// automated session but your real browser still works:
+//
+//   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+//     --remote-debugging-port=9222 --user-data-dir=$HOME/chrome-cdp
+//   # navigate to higgsfield.ai/ai/image, sign in
+//   HIGGS_CDP_URL=http://localhost:9222 node src/index.mjs whoami
+//
+// In CDP mode we reuse the FIRST existing context (not a new one) so we
+// inherit the trusted cookies the user has already accumulated.
 export async function openContext({ headless = true, mode } = {}) {
+  fs.mkdirSync(HF_DIR, { recursive: true });
+
+  // ── CDP mode (highest priority) ───────────────────────────────────────────
+  if (process.env.HIGGS_CDP_URL) {
+    const browser = await chromium.connectOverCDP(process.env.HIGGS_CDP_URL);
+    const ctxs = browser.contexts();
+    const context = ctxs.length ? ctxs[0] : await browser.newContext();
+    // Stealth init script, in case the existing context didn't get one
+    await context.addInitScript(() => {
+      try { window.__rawFetch ||= window.fetch.bind(window); } catch {}
+    });
+    return {
+      context, mode: 'cdp',
+      // Don't close the user's browser; just disconnect.
+      async close() { try { await browser.close(); } catch {} },
+    };
+  }
+
   // Auto-pick: prefer state file if it exists, otherwise persistent dir.
   const resolvedMode = mode || (hasStateFile() ? 'state' : 'profile');
-  fs.mkdirSync(HF_DIR, { recursive: true });
 
   // DataDome's bot fingerprinting trips on plain headless Chromium —
   // navigator.webdriver, missing chrome.runtime, suspicious UA, etc. These

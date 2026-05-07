@@ -251,12 +251,14 @@ async function cmdGen(rest) {
 
     // Video models (Seedance, Veo, Sora, Kling) need ~60-180s before any
     // result is ready. Polling sooner just burns API requests against
-    // datadome's quota. Defaults: 90s initial wait, 15s between polls.
+    // datadome's quota. Frequent polling is itself a behavioral signal that
+    // contributes to bot scoring — keep the cadence calm.
+    // Defaults: 90s initial wait, 30s between polls.
     // Override with --poll-initial-delay <ms> and --poll-interval <ms>.
     const initialDelayMs = args['poll-initial-delay'] !== undefined
       ? parseInt(args['poll-initial-delay'], 10) : 90_000;
     const intervalMs = args['poll-interval'] !== undefined
-      ? parseInt(args['poll-interval'], 10) : 15_000;
+      ? parseInt(args['poll-interval'], 10) : 30_000;
     const result = await pollJob(page, jobId, {
       initialDelayMs, intervalMs,
       onTick: ({ iter, status }) => {
@@ -358,8 +360,12 @@ async function cmdImage(rest) {
     const jobId = submit.body?.job_sets?.[0]?.jobs?.[0]?.id;
     console.log('job id:', jobId);
 
+    // Image polling cadence: 30s between polls. Calmer cadence reduces the
+    // bot-protection behavioral signal from rapid-fire status checks.
+    const imageIntervalMs = args['poll-interval'] !== undefined
+      ? parseInt(args['poll-interval'], 10) : 30_000;
     const result = await pollJob(page, jobId, {
-      intervalMs: 2000,
+      intervalMs: imageIntervalMs,
       onTick: ({ iter, status }) => {
         process.stdout.write(`\r  iter ${iter} status=${status}${' '.repeat(20)}`);
       },
