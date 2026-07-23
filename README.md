@@ -51,7 +51,10 @@ diff:          { sub: 0, credits: 0 }      ← zero cost on Unlimited
 | Wallet diff > 0 with `use_unlim:false` (web default) | ✅ observed | 8,000 credits charged on a single 1080p Seedance 2.0 click |
 | `seedance1_5` `medias` cap                           | ✅ verified | server returns `422 too_long` at 3 items     |
 | Three-step media upload (`/media/batch` → S3 → confirm) | ✅ verified | media id `963ede9e-a75f-4d5a-9869-da266044f651` |
-| `seedance_2_0`                                       | ⚠️ partial  | submission works, multi-image confirmed; full param table not yet documented |
+| `seedance_2_0` text-to-video, 720p/1080p, unlimited  | ✅ verified | 200 + real job, wallet 180000→180000; **this is the working unlimited video model** (`seedance_unlimited` now 403s) — see 2026-07 update |
+| `seedance_unlimited` job type                        | ❌ removed  | returns `403 unlimited_generation_not_allowed`; use `seedance_2_0` |
+| Profile-mode POST on Linux (on-demand, no always-on Chrome) | ✅ verified | `da897712-…` created + cancelled, wallet unchanged |
+| Credit guard (`.credit-lock` kill-switch, `use_unlim` enforcement) | ✅ built-in | blocks any non-unlim submit before the network; verified live |
 | Kling / Veo / Sora / Wan models                      | ⚠️ unverified | should work — same `/jobs/v2/{type}` shape, but each model has its own param schema |
 | Nano Banana Pro image realm slug = `nano-banana-2`   | ✅ verified | server returns `405` for `nano-banana-pro`, `403` (DataDome) for `nano-banana-2` — the latter is the real route |
 | Image realm body shape (`use_unlim` doubled, `use_seedream_bonus`, lowercase `1k`) | ✅ verified | request 574 captured from live web Generate click, body printed in the README |
@@ -71,6 +74,103 @@ Workspace tested: `f113ce73-37cd-4be0-98ea-4331b1fd2b49` (Ahoum design team plan
 | `Generate ⚡ Unlimited`   | Free under your entitlement.                         |
 
 In our tests, a single Seedance 2.0 1080p click with the toggle off cost **8,000 credits** (~½ day's worth on a small plan). The toggle that flips this is somewhere in the form's secondary controls — find it before you click. **This script always sends `use_unlim:true` by default** so you can't make this mistake from the CLI; pass `--no-unlim` to opt out.
+
+---
+
+## 2026-07 update — auth modes, the submit-path reality, and the credit guard
+
+A long verification session (fresh IP, one clean submit+cancel per config) nailed down
+exactly what works. Read this before anything else — it corrects a couple of older
+assumptions in this README.
+
+### The one correction that matters: use `seedance_2_0`, not `seedance_unlimited`
+
+The `seedance_unlimited` job type now returns **`403 unlimited_generation_not_allowed`**.
+The Unlimited entitlement is only honoured through the **web-app's own submission shape**:
+
+```
+POST /jobs/v2/seedance_2_0
+{
+  "params": { "model": "seedance_2_0", "mode": "std", "batch_size": 1,
+              "duration": 15, "aspect_ratio": "9:16", "resolution": "720p",
+              "width": 720, "height": 1280, "generate_audio": false,
+              "bitrate_mode": "high", "prompt": "…", "medias": [] },
+  "use_unlim": true, "use_free_gens": false
+}
+```
+
+Verified live: **200, cost `null`, wallet unchanged** — a real job created. `width`/`height`
+are required. (`seedance_2` is not a valid type; `seedance_2_0`, `seedance_2_0_fast`,
+`seedance_2_0_mini` are.)
+
+### Auth modes — pick one via env
+
+| Mode | How to select | Needs a browser? | Use when |
+| --- | --- | --- | --- |
+| **CDP** (real Chrome) | `HIGGS_CDP_URL=http://localhost:9222` | Yes — a persistent real Chrome you already signed into | The most reliable for POSTs. A long-lived session that has cleared bot-protection once keeps working. |
+| **State file** | `HIGGS_STATE_FILE=./state.json` (default) | Launches a headless/headed Chromium seeded from cookies | Portable, but **cookies-only can't POST** (see below) — fine for GETs. |
+| **Profile** | `HIGGS_PROFILE_DIR=/path/to/chrome-profile` (no CDP/state) | Launches Chrome on a full user-data-dir | On-demand alternative to an always-on CDP Chrome. **This works for POSTs on Linux** (carries device-trust). |
+| **Token** | `HIGGS_TOKEN=<bearer>` (+ `HIGGS_DATADOME`, `HIGGS_CF_BM`) | No — pure `fetch()` | GETs / Clerk only. **Cannot POST jobs** — Cloudflare's managed challenge fingerprints Node's TLS. |
+| `HIGGS_HEADED=1` | modifier on state/profile | forces a visible window | to solve a captcha by hand once |
+
+### What actually clears bot protection (the submit-path map)
+
+The video **POST** (`fnf.higgsfield.ai/jobs`) sits behind **two** independent layers —
+Cloudflare's managed challenge (checks TLS/JA3 fingerprint) **and** DataDome (scores the
+live session/fingerprint, not just cookies). GETs (`whoami`, wallet, `/user`) are ungated;
+only the POST is. Results, all on a fresh IP, same instant:
+
+| Path | Result |
+| --- | --- |
+| **CDP — real persistent Chrome** | ✅ 200 |
+| **Profile mode (full profile) on Linux** | ✅ login restores + GETs 200; POST works (may need a one-time captcha, see below) |
+| Headless / headed with **cookies-only** `state.json` | ❌ 403 DataDome (fingerprint) |
+| **Token / Node `fetch`** (browserless) | ❌ 403 Cloudflare "Just a moment" (JA3 fingerprint) |
+
+Takeaways:
+- **Browserless auth is fine, browserless *submit* is not.** You can mint a fresh Clerk JWT
+  with no browser (POST the long-lived `__client` cookie to
+  `clerk.higgsfield.ai/v1/client/sessions/{sid}/tokens`), but the job POST needs a real
+  browser fingerprint.
+- **Cookies-only isn't enough for a fresh session** — Playwright `storageState` captures
+  `origins: 0` (no localStorage/IndexedDB), which is where DataDome/Clerk device-trust
+  lives. Profile mode carries the full profile, so it restores login and submits.
+- **macOS can't test profile mode** (cookies are Keychain-encrypted + Playwright uses
+  `--use-mock-keychain`). Linux profiles are portable — test/deploy there.
+
+### The captcha is periodic, not per-request
+
+A profile-mode POST sometimes returns a **DataDome interactive captcha** (an HTML page
+whose body contains `#cmsg`) — solve it **once** in a visible browser (`HIGGS_HEADED=1`,
+or a noVNC view of the headed Chrome) and the session clears; subsequent POSTs go straight
+through until DataDome next challenges. It does **not** captcha every request. A cleared
+CDP session that stays alive is why the always-on CDP setup "just works".
+
+### Credit guard (built in)
+
+`src/jobs.mjs` now routes every submit through `guardedSubmit()`:
+- refuses any body where `use_unlim !== true` **before** it hits the network,
+- verifies `cost` is 0/null and the wallet didn't drop **after** an accepted submit,
+- trips a persistent **`.credit-lock`** file that blocks *all* further submissions if
+  credits were ever charged (delete the file to reset).
+
+Deliberate paid runs require `HIGGS_ALLOW_CREDITS=1`. This makes "spend credits by
+accident" impossible from the CLI — failure is tolerable, a charge is not.
+
+### Verified Unlimited entitlement matrix (Max plan)
+
+The "top models" (Seedance 2.0 Fast/Mini, Kling 3.0, Nano Banana Pro/2, GPT Image 2,
+Seedream 5 Pro, …) are **excluded** from Unlimited mode. What *is* covered:
+
+| Model | 480p | 720p | 1080p | 4K |
+| --- | --- | --- | --- | --- |
+| `seedance_2_0` (video) | 4–15s | 4–15s | **4–8s only** | ✗ |
+| `seedance_2_0_mini` (video) | 4–15s | 4–15s | ✗ | ✗ |
+| Image (365-unlimited roster) | `nano_banana` (plain), `seedream_v5_lite`, `seedream_v4_5`, Kling O1 Image, GPT Image, Flux.2 Pro (1K) | | | |
+
+Bitrate does not gate the entitlement (verified at `bitrate_mode:"high"`). Probe method:
+submit `use_unlim:true` and instantly cancel (`PUT /jobs/{id}/cancel`) — 200 = covered,
+403 = would charge.
 
 ---
 

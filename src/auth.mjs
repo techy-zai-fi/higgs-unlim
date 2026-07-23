@@ -154,6 +154,10 @@ export async function openContext({ headless = true, mode } = {}) {
 }
 
 export async function ensureLoggedIn(page, { land = 'video' } = {}) {
+  // Fast path: Clerk already loaded (e.g. CDP mode on an existing open tab).
+  const already = await page.evaluate(() => !!window.Clerk?.session).catch(() => false);
+  if (already) return true;
+
   // Land on /ai/image when image realm flows are coming, /ai/video otherwise.
   // Clerk hydration is faster on the page that the user actually wants to use,
   // and the datadome cookie matches that surface.
@@ -175,6 +179,40 @@ export async function ensureLoggedIn(page, { land = 'video' } = {}) {
 // session. Skipping the wrappers avoids the "Failed to fetch" they throw in
 // headless contexts.
 export async function apiFetch(page, { method = 'GET', path: p, body } = {}) {
+  // HIGGS_TOKEN fast path — skip Playwright entirely.
+  // Set HIGGS_TOKEN=<bearer_jwt> and optionally HIGGS_DATADOME=<clientid>.
+  // Clerk JWTs expire in ~60s so grab a fresh one from DevTools → Network tab
+  // on any fnf.higgsfield.ai request, copy the Authorization header value.
+  if (process.env.HIGGS_TOKEN) {
+    const token = process.env.HIGGS_TOKEN.replace(/^Bearer\s+/i, '');
+    const dd = process.env.HIGGS_DATADOME || '';
+    const cfBm = process.env.HIGGS_CF_BM || '';
+    const hdrs = {
+      'Authorization': 'Bearer ' + token,
+      'Content-Type': 'application/json',
+      'Origin': 'https://higgsfield.ai',
+      'Referer': 'https://higgsfield.ai/',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36',
+      'sec-fetch-dest': 'empty',
+      'sec-fetch-mode': 'cors',
+      'sec-fetch-site': 'same-site',
+    };
+    if (dd) hdrs['x-datadome-clientid'] = dd;
+    if (cfBm) hdrs['Cookie'] = `__cf_bm=${cfBm}`;
+    const url = API + p;
+    try {
+      const r = await fetch(url, {
+        method, headers: hdrs,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+      const txt = await r.text();
+      let parsed; try { parsed = JSON.parse(txt); } catch { parsed = txt; }
+      return { status: r.status, body: parsed };
+    } catch (e) {
+      return { status: -1, body: { error: 'fetch_threw', message: String(e?.message || e) } };
+    }
+  }
+
   const result = await page.evaluate(async ({ method, p, body }) => {
     const sess = window.Clerk?.session;
     if (!sess) return { status: 0, body: { error: 'not_signed_in' } };

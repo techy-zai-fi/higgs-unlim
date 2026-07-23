@@ -28,16 +28,25 @@
 //   --audio                            generate_audio=true
 //   --fixed-lens                       fixed_lens=true
 //   --seed <int>                       seed for reproducible runs
+//   --bitrate-mode <standard|high>     bitrate_mode (default: omitted; "high" for seedance_unlimited)
 //
 //   --start-image <path>               local file → upload → role:start_image
 //   --start-image-id <uuid> --start-image-url <url>   pre-uploaded media
 //   --end-image <path>                 local file → upload → role:end_image
 //   --end-image-id <uuid> --end-image-url <url>       pre-uploaded media
 //
+//   --count <N>                        run N generations sequentially (default 1)
 //   --no-unlim                         use_unlim=false (charges credits)
 //   --free-gens                        use_free_gens=true
 //   --extra k=v                        push arbitrary param into params (repeatable)
 //   --param-extra k=v                  same, but at top-level body (e.g. for new flags)
+//
+// CDP mode (bypass Cloudflare — use your real Chrome):
+//   /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+//     --remote-debugging-port=9222 --user-data-dir=$HOME/chrome-cdp
+//   # sign in to higgsfield.ai in that Chrome window, then:
+//   HIGGS_CDP_URL=http://localhost:9222 higgs-unlim gen seedance_unlimited \
+//     --prompt "..." --duration 15 --res 720p --ar 9:16 --audio --bitrate-mode high
 //
 // Examples:
 //   higgs-unlim gen seedance1_5 --prompt "the guy saying hi" --duration 8 --res 480p --audio
@@ -79,12 +88,40 @@ function coerce(v) {
 }
 
 async function withCtx(headless, fn) {
+  // HIGGS_TOKEN fast path — no browser at all.
+  if (process.env.HIGGS_TOKEN) return fn(null);
+
   // HIGGS_HEADED=1 forces a visible browser (useful when DataDome / Cloudflare
   // are challenging the headless instance — you can solve a captcha live).
   const wantHeaded = process.env.HIGGS_HEADED === '1';
   const handle = await openContext({ headless: wantHeaded ? false : headless });
   try {
-    const page = await handle.context.newPage();
+    let page;
+    if (process.env.HIGGS_CDP_URL) {
+      // CDP mode: reuse an existing Higgsfield page so we inherit CF cookies and
+      // Clerk session already loaded in the user's real Chrome.
+      const pages = handle.context.pages();
+      page = pages.find(p => /higgsfield\.ai/.test(p.url())) || pages[0];
+      if (!page) page = await handle.context.newPage();
+      // addInitScript only fires on future navigations; inject __rawFetch now
+      // for pages that were already open when we connected.
+      await page.evaluate(() => {
+        try { window.__rawFetch = window.__rawFetch || window.fetch.bind(window); } catch {}
+      }).catch(() => {});
+      // Warm CF clearance for the fnf.higgsfield.ai API zone in a background tab.
+      // CF issues a zone-specific cf_clearance on the first GET; once set, POSTs pass.
+      // Cookies are shared across the context so the main page benefits immediately.
+      if (process.env.HIGGS_SKIP_WARMUP !== '1') {
+        process.stdout.write('Warming CF clearance for fnf.higgsfield.ai... ');
+        const warmup = await handle.context.newPage();
+        await warmup.goto('https://fnf.higgsfield.ai/user', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 5000));
+        await warmup.close().catch(() => {});
+        console.log('done');
+      }
+    } else {
+      page = await handle.context.newPage();
+    }
     if (process.env.HIGGS_DEBUG_NET === '1') {
       const interesting = u => /fnf\.higgsfield|jobs|cors|preflight/.test(u);
       page.on('request', req => {
@@ -134,13 +171,21 @@ async function cmdLogin() {
   // Also touch /ai/image so its surface-specific cookies land too
   await page.goto('https://higgsfield.ai/ai/image?model=nano-banana-pro', { waitUntil: 'domcontentloaded' });
   await new Promise(r => setTimeout(r, 2000));
+  // Navigate to the API domain so Cloudflare's non-interactive challenge auto-solves
+  // and cf_clearance for fnf.higgsfield.ai is saved into state.json.
+  console.log('Warming Cloudflare clearance for fnf.higgsfield.ai...');
+  await page.goto('https://fnf.higgsfield.ai/user', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+  await new Promise(r => setTimeout(r, 6000));
+  // Return to the video page to keep Clerk session context in state
+  await page.goto('https://higgsfield.ai/ai/video', { waitUntil: 'domcontentloaded' });
+  await new Promise(r => setTimeout(r, 1000));
   console.log('Logged in. State written to:', STATE_FILE);
   await handle.close(true);
 }
 
 async function cmdWhoami() {
   await withCtx(true, async page => {
-    if (!await ensureLoggedIn(page)) die('Not signed in. Run `higgs-unlim login` first.');
+    if (page && !await ensureLoggedIn(page)) die('Not signed in. Run `higgs-unlim login` first.');
     const user = await getUser(page);
     const wallet = await getWallet(page);
     console.log('user:    ', user?.email);
@@ -157,7 +202,7 @@ async function cmdUpload(rest) {
   const file = args._[0];
   if (!file) die('usage: higgs-unlim upload <file>');
   await withCtx(true, async page => {
-    if (!await ensureLoggedIn(page)) die('Not signed in. Run `higgs-unlim login` first.');
+    if (page && !await ensureLoggedIn(page)) die('Not signed in. Run `higgs-unlim login` first.');
     const surface = args.surface || 'seedance_2';
     const r = await uploadFile(page, file, { surface });
     console.log(JSON.stringify(r, null, 2));
@@ -170,7 +215,7 @@ async function cmdGen(rest) {
   if (!jobSetType) die('usage: higgs-unlim gen <job_set_type> [opts]');
 
   await withCtx(true, async page => {
-    if (!await ensureLoggedIn(page)) die('Not signed in. Run `higgs-unlim login` first.');
+    if (page && !await ensureLoggedIn(page)) die('Not signed in. Run `higgs-unlim login` first.');
 
     // Build params
     const params = {
@@ -186,6 +231,7 @@ async function cmdGen(rest) {
     if (args.seed) params.seed = parseInt(args.seed, 10);
     if (args.width) params.width = parseInt(args.width, 10);
     if (args.height) params.height = parseInt(args.height, 10);
+    if (args['bitrate-mode']) params.bitrate_mode = args['bitrate-mode'];
 
     // Resolve start/end frames: either local file (upload) or pre-uploaded id+url
     if (args['start-image']) {
@@ -233,47 +279,58 @@ async function cmdGen(rest) {
       }
     }
 
-    const w0 = await getWallet(page);
-    console.log('wallet before:', { sub: w0.subscription_balance, credits: w0.credits_balance });
-    console.log('submitting:', jobSetType, 'use_unlim:', body.use_unlim, 'medias:', params.medias.map(m => m.role));
-
-    const submit = await submitJob(page, jobSetType, body);
-    if (submit.status !== 200) {
-      console.error('submit failed:', submit.status, JSON.stringify(submit.body, null, 2));
-      if (submit.body?.error === 'datadome_or_cloudflare') {
-        console.error('\nTip: re-run with HIGGS_HEADED=1 to open a visible browser. If a captcha appears,');
-        console.error('solve it once — the script will pick up the trusted cookie automatically.');
-      }
-      process.exit(1);
-    }
-    const jobId = submit.body?.job_sets?.[0]?.jobs?.[0]?.id;
-    console.log('job id:', jobId);
-
-    // Video models (Seedance, Veo, Sora, Kling) need ~60-180s before any
-    // result is ready. Polling sooner just burns API requests against
-    // datadome's quota. Frequent polling is itself a behavioral signal that
-    // contributes to bot scoring — keep the cadence calm.
-    // Defaults: 90s initial wait, 30s between polls.
-    // Override with --poll-initial-delay <ms> and --poll-interval <ms>.
+    const count = args.count ? parseInt(args.count, 10) : 1;
     const initialDelayMs = args['poll-initial-delay'] !== undefined
       ? parseInt(args['poll-initial-delay'], 10) : 90_000;
     const intervalMs = args['poll-interval'] !== undefined
       ? parseInt(args['poll-interval'], 10) : 30_000;
-    const result = await pollJob(page, jobId, {
-      initialDelayMs, intervalMs,
-      onTick: ({ iter, status }) => {
-        const label = iter === -1 ? '' : ` iter ${iter}`;
-        process.stdout.write(`\r ${label} status=${status}${' '.repeat(40)}`);
-      },
-    });
-    process.stdout.write('\n');
 
-    const final = result.body;
-    const url = final?.results?.raw?.url || final?.result?.url;
-    if (url) console.log('video:', url);
-    const thumb = final?.results?.raw?.thumbnail_url;
-    if (thumb) console.log('thumb:', thumb);
-    if (!url) console.log('final:', JSON.stringify(final, null, 2));
+    const w0 = await getWallet(page);
+    console.log('wallet before:', { sub: w0.subscription_balance, credits: w0.credits_balance });
+
+    const results = [];
+    for (let i = 0; i < count; i++) {
+      if (count > 1) console.log(`\n── video ${i + 1}/${count} ──`);
+      console.log('submitting:', jobSetType, 'use_unlim:', body.use_unlim, 'medias:', params.medias.map(m => m.role));
+
+      const submit = await submitJob(page, jobSetType, body);
+      if (submit.status !== 200) {
+        console.error('submit failed:', submit.status, JSON.stringify(submit.body, null, 2));
+        if (submit.body?.error === 'datadome_or_cloudflare') {
+          console.error('\nTip: re-run with HIGGS_HEADED=1 to open a visible browser. If a captcha appears,');
+          console.error('solve it once — the script will pick up the trusted cookie automatically.');
+        }
+        process.exit(1);
+      }
+      const jobId = submit.body?.job_sets?.[0]?.jobs?.[0]?.id;
+      console.log('job id:', jobId);
+
+      // Video models (Seedance, Veo, Sora, Kling) need ~60-180s before any
+      // result is ready. Polling sooner just burns API requests against
+      // datadome's quota. Frequent polling is itself a behavioral signal that
+      // contributes to bot scoring — keep the cadence calm.
+      // Defaults: 90s initial wait, 30s between polls.
+      const result = await pollJob(page, jobId, {
+        initialDelayMs, intervalMs,
+        onTick: ({ iter, status }) => {
+          const label = iter === -1 ? '' : ` iter ${iter}`;
+          process.stdout.write(`\r  ${label} status=${status}${' '.repeat(40)}`);
+        },
+      });
+      process.stdout.write('\n');
+
+      const final = result.body;
+      const url = final?.results?.raw?.url || final?.result?.url;
+      if (url) { console.log('video:', url); results.push(url); }
+      const thumb = final?.results?.raw?.thumbnail_url;
+      if (thumb) console.log('thumb:', thumb);
+      if (!url) console.log('final:', JSON.stringify(final, null, 2));
+    }
+
+    if (count > 1 && results.length) {
+      console.log('\n── all videos ──');
+      results.forEach((u, i) => console.log(`  ${i + 1}. ${u}`));
+    }
 
     const w1 = await getWallet(page);
     console.log('wallet after: ', { sub: w1.subscription_balance, credits: w1.credits_balance });
@@ -290,7 +347,7 @@ async function cmdImage(rest) {
   if (!jobSetType) die('usage: higgs-unlim image <job_set_type> [--prompt "..."] [--ar 1:1] [--res 1k|2k|4k] [--width N --height N] [--batch N] [--input-image <path>]... [--seed N] [--no-unlim] [--extra k=v]...');
 
   await withCtx(true, async page => {
-    if (!await ensureLoggedIn(page, { land: 'image' })) die('Not signed in. Run `higgs-unlim login` first.');
+    if (page && !await ensureLoggedIn(page, { land: 'image' })) die('Not signed in. Run `higgs-unlim login` first.');
 
     // Resolve any --input-image local files (auto-upload). Repeatable.
     const inputImageEntries = [];
